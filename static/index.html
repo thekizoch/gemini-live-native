@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gemini Live Native Audio</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            margin: 0;
+            background-color: #f0f0f0;
+        }
+        .container {
+            background-color: #fff;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        button {
+            padding: 10px 15px;
+            margin: 5px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        #startButton {
+            background-color: #4CAF50;
+            color: white;
+        }
+        #stopButton {
+            background-color: #f44336;
+            color: white;
+        }
+        #status {
+            margin-top: 15px;
+            font-style: italic;
+            color: #555;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Gemini Live Native Audio Stream</h1>
+        <button id="startButton">Start Session</button>
+        <button id="stopButton" disabled>Stop Session</button>
+        <p id="status">Ready</p>
+    </div>
+
+    <script>
+        const startButton = document.getElementById('startButton');
+        const stopButton = document.getElementById('stopButton');
+        const statusDisplay = document.getElementById('status');
+
+        startButton.addEventListener('click', async () => {
+            statusDisplay.textContent = 'Starting session...';
+            startButton.disabled = true;
+            try {
+                const response = await fetch('/start-session', { method: 'POST' });
+                const data = await response.json();
+                if (response.ok) {
+                    statusDisplay.textContent = data.message || 'Session started. Speak into your microphone.';
+                    stopButton.disabled = false;
+                } else {
+                    statusDisplay.textContent = `Error: ${data.detail || 'Failed to start session'}`;
+                    startButton.disabled = false;
+                }
+            } catch (error) {
+                statusDisplay.textContent = `Error: ${error.message}`;
+                startButton.disabled = false;
+            }
+        });
+
+        stopButton.addEventListener('click', async () => {
+            statusDisplay.textContent = 'Stopping session...';
+            stopButton.disabled = true;
+            try {
+                const response = await fetch('/stop-session', { method: 'POST' });
+                const data = await response.json();
+                if (response.ok) {
+                    statusDisplay.textContent = data.message || 'Session stopped.';
+                    startButton.disabled = false;
+                } else {
+                    statusDisplay.textContent = `Error: ${data.detail || 'Failed to stop session'}`;
+                    stopButton.disabled = false; // Re-enable if stopping failed
+                }
+            } catch (error) {
+                statusDisplay.textContent = `Error: ${error.message}`;
+                stopButton.disabled = false; // Re-enable if stopping failed
+            }
+        });
+    </script>
+</body>
+</html>

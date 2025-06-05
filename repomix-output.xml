@@ -1,0 +1,887 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+<additional_info>
+
+</additional_info>
+
+</file_summary>
+
+<directory_structure>
+app/
+  audio_io_handler.py
+  gemini_service.py
+  main.py
+static/
+  index.html
+.python-version
+pyproject.toml
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="app/audio_io_handler.py">
+import asyncio
+import pyaudio
+
+# Audio format constants
+CHUNK_SIZE = 1024  # Number of frames per buffer for PyAudio
+FORMAT = pyaudio.paInt16  # Audio format (16-bit PCM)
+CHANNELS_INPUT = 1  # Number of audio channels for input (mono)
+CHANNELS_OUTPUT = 1 # Number of audio channels for output (mono)
+INPUT_RATE = 16000  # Sampling rate for input audio (Hz)
+OUTPUT_RATE = 24000  # Sampling rate for output audio (Hz) - Gemini native audio output rate
+
+class AudioIOHandler:
+    """
+    Handles local audio input (microphone) and output (speaker) using PyAudio.
+    Designed to be used with asyncio for non-blocking operations.
+    """
+
+    def __init__(self, mic_to_gemini_queue: asyncio.Queue, gemini_to_speaker_queue: asyncio.Queue):
+        """
+        Initializes the AudioIOHandler.
+
+        Args:
+            mic_to_gemini_queue: An asyncio.Queue to send microphone audio chunks to.
+            gemini_to_speaker_queue: An asyncio.Queue to receive audio chunks from for playback.
+        """
+        self.mic_to_gemini_queue = mic_to_gemini_queue
+        self.gemini_to_speaker_queue = gemini_to_speaker_queue
+        
+        self._pyaudio_instance = None # Initialized on first use or explicitly
+        self._input_stream = None
+        self._output_stream = None
+        
+        self._stop_event = asyncio.Event() # Signals threads to stop
+        self._loop = asyncio.get_running_loop() # Capture the loop for threadsafe calls
+
+        self._is_recording_active_flag = False # Internal flag for loop state
+        self._is_playback_active_flag = False  # Internal flag for loop state
+    
+    def _ensure_pyaudio_instance(self):
+        if self._pyaudio_instance is None:
+            self._pyaudio_instance = pyaudio.PyAudio()
+
+    def _blocking_record_loop(self):
+        """
+        Synchronous blocking loop for recording audio.
+        This method is intended to be run in a separate thread via asyncio.to_thread.
+        """
+        self._ensure_pyaudio_instance()
+        self._is_recording_active_flag = True
+        try:
+            self._input_stream = self._pyaudio_instance.open(
+                format=FORMAT,
+                channels=CHANNELS_INPUT,
+                rate=INPUT_RATE,
+                input=True,
+                frames_per_buffer=CHUNK_SIZE
+            )
+            print("AudioIOHandler: Microphone recording stream opened.")
+            while not self._stop_event.is_set():
+                try:
+                    data = self._input_stream.read(CHUNK_SIZE, exception_on_overflow=False)
+                    if not data: # Should not happen with a live stream unless error
+                        print("AudioIOHandler: No data read from microphone, ending record loop.")
+                        break
+                    
+                    future = asyncio.run_coroutine_threadsafe(self.mic_to_gemini_queue.put(data), self._loop)
+                    future.result() # Wait for the put to complete in the event loop
+
+                except IOError as e:
+                    # PyAudio specific error check for input overflow might be needed
+                    # For example, e.args[0] might contain paInputOverflowed for some versions/platforms
+                    if "Input overflowed" in str(e): # Generic check
+                        print("AudioIOHandler: Input overflowed. Skipping frame.")
+                        continue
+                    elif self._stop_event.is_set():
+                        print("AudioIOHandler: Recording loop: Stop event received during IOError.")
+                        break
+                    print(f"AudioIOHandler: IOError reading from microphone: {e}")
+                    break 
+                except Exception as e:
+                    if self._stop_event.is_set():
+                        print("AudioIOHandler: Recording loop: Stop event received during generic Exception.")
+                        break
+                    print(f"AudioIOHandler: Unexpected error in recording loop: {e}")
+                    break
+        except Exception as e:
+            print(f"AudioIOHandler: Failed to start or maintain microphone recording: {e}")
+        finally:
+            if self._input_stream:
+                try:
+                    if self._input_stream.is_active(): # Check if stream is active before stopping
+                         self._input_stream.stop_stream()
+                    self._input_stream.close()
+                except Exception as e_close:
+                    print(f"AudioIOHandler: Error closing input stream: {e_close}")
+                self._input_stream = None
+            self._is_recording_active_flag = False
+            print("AudioIOHandler: Microphone recording stream closed and loop finished.")
+
+    async def record_audio(self):
+        """
+        Starts recording audio from the default microphone.
+        Runs the PyAudio blocking calls in a separate thread.
+        """
+        if self._is_recording_active_flag : # Check internal flag
+            print("AudioIOHandler: Recording is already in progress.")
+            return
+        
+        self._stop_event.clear() # Clear stop event before starting a new session
+        print("AudioIOHandler: Starting audio recording task...")
+        try:
+            await asyncio.to_thread(self._blocking_record_loop)
+        except Exception as e:
+            print(f"AudioIOHandler: Exception from record_audio thread: {e}")
+        finally:
+            print("AudioIOHandler: Audio recording task awaited and finished.")
+
+
+    def _blocking_play_loop(self):
+        """
+        Synchronous blocking loop for playing audio.
+        This method is intended to be run in a separate thread via asyncio.to_thread.
+        """
+        self._ensure_pyaudio_instance()
+        self._is_playback_active_flag = True
+        try:
+            self._output_stream = self._pyaudio_instance.open(
+                format=FORMAT,
+                channels=CHANNELS_OUTPUT,
+                rate=OUTPUT_RATE,
+                output=True,
+                frames_per_buffer=CHUNK_SIZE 
+            )
+            print("AudioIOHandler: Speaker playback stream opened.")
+            while not self._stop_event.is_set():
+                audio_chunk = None
+                try:
+                    # Get data from the asyncio queue from this thread
+                    # Use a timeout to periodically check the stop_event
+                    # asyncio.wait_for needs to run in the loop, so we submit the coro
+                    get_coro = self.gemini_to_speaker_queue.get()
+                    timed_get_coro = asyncio.wait_for(get_coro, timeout=0.1)
+                    
+                    future = asyncio.run_coroutine_threadsafe(timed_get_coro, self._loop)
+                    audio_chunk = future.result() # Blocks this thread until get (with timeout) completes
+
+                    if audio_chunk is None: 
+                        print("AudioIOHandler: Playback loop: Received None sentinel, stopping.")
+                        asyncio.run_coroutine_threadsafe(self.gemini_to_speaker_queue.task_done(), self._loop).result()
+                        break
+                    
+                    self._output_stream.write(audio_chunk)
+                    asyncio.run_coroutine_threadsafe(self.gemini_to_speaker_queue.task_done(), self._loop).result()
+
+                except asyncio.TimeoutError: # From wait_for timeout
+                    continue # Expected if queue is empty, allows checking _stop_event
+                except Exception as e: 
+                    if self._stop_event.is_set():
+                        print("AudioIOHandler: Playback loop: Stop event received during Exception.")
+                        if audio_chunk is not None and audio_chunk is not Ellipsis : # Ellipsis might be used internally by Queue
+                             asyncio.run_coroutine_threadsafe(self.gemini_to_speaker_queue.task_done(), self._loop).result()
+                        break
+                    print(f"AudioIOHandler: Error in playback loop: {e}")
+                    if audio_chunk is not None and audio_chunk is not Ellipsis:
+                         asyncio.run_coroutine_threadsafe(self.gemini_to_speaker_queue.task_done(), self._loop).result()
+                    break
+        except Exception as e:
+            print(f"AudioIOHandler: Failed to start or maintain speaker playback: {e}")
+        finally:
+            if self._output_stream:
+                try:
+                    if self._output_stream.is_active():
+                        self._output_stream.stop_stream()
+                    self._output_stream.close()
+                except Exception as e_close:
+                    print(f"AudioIOHandler: Error closing output stream: {e_close}")
+                self._output_stream = None
+            self._is_playback_active_flag = False
+            print("AudioIOHandler: Speaker playback stream closed and loop finished.")
+
+    async def play_audio(self):
+        """
+        Starts playing audio to the default speaker.
+        Runs the PyAudio blocking calls in a separate thread.
+        """
+        if self._is_playback_active_flag: # Check internal flag
+            print("AudioIOHandler: Playback is already in progress.")
+            return
+        
+        # self._stop_event should be managed by the caller via start/stop calls.
+        # It's cleared in record_audio, assuming record_audio is called first in a session.
+        # If play_audio can be called independently, ensure _stop_event is clear if needed.
+        # For this design, stop() sets it, and it's cleared when starting a new "session" (e.g. record_audio)
+        print("AudioIOHandler: Starting audio playback task...")
+        try:
+            await asyncio.to_thread(self._blocking_play_loop)
+        except Exception as e:
+            print(f"AudioIOHandler: Exception from play_audio thread: {e}")
+        finally:
+            print("AudioIOHandler: Audio playback task awaited and finished.")
+
+    async def stop(self):
+        """
+        Signals the recording and playback loops to stop and cleans up PyAudio resources.
+        This method should be called after the tasks running record_audio and play_audio
+        have been awaited or cancelled.
+        """
+        print("AudioIOHandler: Stop requested.")
+        if not self._stop_event.is_set():
+            self._stop_event.set()
+            print("AudioIOHandler: Stop event set.")
+
+        # Attempt to unblock the playback queue if it's waiting
+        # This helps the _blocking_play_loop exit cleanly if it's stuck on queue.get()
+        try:
+            # Don't wait indefinitely, the loop might already be stopping
+            await asyncio.wait_for(self.gemini_to_speaker_queue.put(None), timeout=0.5)
+            print("AudioIOHandler: None sentinel put into playback queue to unblock.")
+        except asyncio.QueueFull:
+            print("AudioIOHandler: Playback queue full, couldn't put None sentinel. Loop might be stopping or full.")
+        except asyncio.TimeoutError:
+            print("AudioIOHandler: Timeout putting None sentinel to playback queue.")
+        except Exception as e:
+            print(f"AudioIOHandler: Error putting None sentinel to playback queue: {e}")
+        
+        # The threads running _blocking_record_loop and _blocking_play_loop
+        # should detect _stop_event and terminate. The tasks that launched them
+        # (created by FastAPI endpoint) must be awaited or cancelled to ensure
+        # these threads actually finish before PyAudio is terminated.
+
+        if self._pyaudio_instance:
+            print("AudioIOHandler: Terminating PyAudio instance.")
+            try:
+                # Terminate can also be blocking, run in thread if issues arise
+                # For now, direct call.
+                await asyncio.to_thread(self._pyaudio_instance.terminate)
+                self._pyaudio_instance = None
+                print("AudioIOHandler: PyAudio instance terminated.")
+            except Exception as e:
+                print(f"AudioIOHandler: Error terminating PyAudio instance: {e}")
+        
+        print("AudioIOHandler: Stop processing completed.")
+
+    def is_recording(self) -> bool:
+        """Returns True if the recording loop is currently active."""
+        return self._is_recording_active_flag
+
+    def is_playing(self) -> bool:
+        """Returns True if the playback loop is currently active."""
+        return self._is_playback_active_flag
+</file>
+
+<file path="app/gemini_service.py">
+import asyncio
+import os
+from google import genai
+from google.genai import types
+
+# Ensure GOOGLE_GENAI_API_KEY is available, genai.configure will use it.
+# This is typically loaded by python-dotenv in main.py before this module is heavily used.
+if not os.environ.get("GOOGLE_GENAI_API_KEY"):
+    print("Warning: GOOGLE_GENAI_API_KEY not found in environment. GeminiLiveService may fail to initialize.")
+
+class GeminiLiveService:
+    """
+    Manages the connection and audio streaming with the Gemini Live API.
+    """
+
+    MODEL_NAME = "gemini-2.5-flash-preview-native-audio-dialog"
+
+    def __init__(self, mic_to_gemini_queue: asyncio.Queue, gemini_to_speaker_queue: asyncio.Queue):
+        """
+        Initializes the GeminiLiveService.
+
+        Args:
+            mic_to_gemini_queue: An asyncio.Queue to get microphone audio chunks from.
+            gemini_to_speaker_queue: An asyncio.Queue to send Gemini audio chunks to for playback.
+        """
+        self.mic_to_gemini_queue = mic_to_gemini_queue
+        self.gemini_to_speaker_queue = gemini_to_speaker_queue
+        
+        self.api_client = None # Will be initialized in start_session
+        self.session: LiveSession | None = None
+        
+        self._stop_event = asyncio.Event()
+        self._is_session_active = False # Tracks if start_session has been successfully run
+
+    async def _send_audio_stream(self):
+        """
+        Reads audio chunks from mic_to_gemini_queue and sends them to the Gemini session.
+        """
+        print("GeminiService: Starting audio send stream...")
+        try:
+            while not self._stop_event.is_set():
+                if not self.session or self.session.closed or self.session.input_closed:
+                    print("GeminiService: Send stream: Session is not active or input is closed.")
+                    break
+                
+                audio_chunk = None
+                try:
+                    audio_chunk = await asyncio.wait_for(self.mic_to_gemini_queue.get(), timeout=0.1)
+                    if audio_chunk is None: # Sentinel value from stop_session
+                        print("GeminiService: Send stream: Received None sentinel, stopping.")
+                        self.mic_to_gemini_queue.task_done() # Mark sentinel as processed
+                        break
+                    
+                    if not self.session.input_closed: # Double check before sending
+                        await self.session.send(input={"data": audio_chunk, "mime_type": "audio/pcm"})
+                    else:
+                        print("GeminiService: Send stream: Session input closed before send, discarding chunk.")
+                    self.mic_to_gemini_queue.task_done()
+
+                except asyncio.TimeoutError:
+                    continue # Normal, allows checking _stop_event
+                except StopCandidateException: # Raised by SDK if server signals to stop sending
+                    print("GeminiService: Send stream: StopCandidateException. Server may have closed input.")
+                    if audio_chunk is not None: self.mic_to_gemini_queue.task_done() # ensure task_done
+                    break
+                except Exception as e:
+                    print(f"GeminiService: Error in send stream: {e}")
+                    if audio_chunk is not None: self.mic_to_gemini_queue.task_done() # ensure task_done
+                    # Propagate stop if a critical error occurs
+                    self._stop_event.set()
+                    break
+        finally:
+            print("GeminiService: Audio send stream finished.")
+            # Attempt to close input stream if session is still partially open
+            if self.session and not self.session.closed and not self.session.input_closed:
+                try:
+                    print("GeminiService: Send stream: Closing session input.")
+                    await self.session.close_input()
+                except Exception as e_close_input:
+                    print(f"GeminiService: Send stream: Error closing session input: {e_close_input}")
+
+    async def _receive_audio_stream(self):
+        """
+        Receives audio data from the Gemini session and puts it into gemini_to_speaker_queue.
+        """
+        print("GeminiService: Starting audio receive stream...")
+        try:
+            while not self._stop_event.is_set():
+                if not self.session or self.session.closed:
+                    print("GeminiService: Receive stream: Session is not active or closed.")
+                    break
+                try:
+                    async for response in self.session.receive():
+                        if self._stop_event.is_set():
+                            print("GeminiService: Receive stream: Stop event set, breaking from loop.")
+                            break
+                        
+                        if response.error:
+                            print(f"GeminiService: Received an error from Gemini: {response.error}")
+                            self._stop_event.set() # Signal other loops too
+                            break
+
+                        if response.data: # This is the audio data (bytes)
+                            await self.gemini_to_speaker_queue.put(response.data)
+                        
+                        if response.results:
+                            for result in response.results:
+                                if hasattr(result, 'text') and result.text:
+                                     print(f"GeminiService: Received text (e.g. STT): {result.text}")
+                    
+                    # If the loop finishes normally, it means the session's receive stream ended.
+                    print("GeminiService: Receive stream: session.receive() iterator finished.")
+                    self._stop_event.set() # Signal send stream to stop as well
+                    break 
+
+                except Exception as e:
+                    if self._stop_event.is_set() or isinstance(e, asyncio.CancelledError):
+                        print(f"GeminiService: Receive stream: Loop interrupted by stop/cancel: {e}")
+                    else:
+                        print(f"GeminiService: Error in receive stream: {e}")
+                        self._stop_event.set() # Propagate stop on unexpected error
+                    break
+        finally:
+            print("GeminiService: Audio receive stream finished.")
+
+    async def start_session(self):
+        """
+        Establishes a connection with the Gemini Live API and starts audio streaming.
+        This method is intended to be run as a long-running task.
+        """
+        if self._is_session_active:
+            print("GeminiService: Session is already active.")
+            return
+
+        self._stop_event.clear()
+        
+        print("GeminiService: Starting session...")
+        try:
+            # Ensure genai is configured. It's safe to call multiple times.
+            # GOOGLE_GENAI_API_KEY should be in os.environ.
+            if not os.environ.get("GOOGLE_GENAI_API_KEY"):
+                 msg = "GeminiService: GOOGLE_GENAI_API_KEY not found in environment variables at start_session."
+                 print(msg)
+                 raise ValueError(msg)
+
+            self.api_client = genai.Client(api_key=os.environ["GOOGLE_GENAI_API_KEY"])
+
+            live_config = types.LiveConnectConfig(
+                response_modalities=["AUDIO"]
+                # Other possible configurations:
+                # processing_strategy=genai.types.LiveProcessingStrategy.INTERIM_RESULTS,
+                # input_audio_config=genai.types.LiveAudioConfig(sample_rate_hertz=16000) # if STT is also a primary goal
+            )
+            
+            print(f"GeminiService: Connecting to model {self.MODEL_NAME}...")
+            self.session = await self.api_client.aio.live.connect(
+                model=self.MODEL_NAME,
+                config=live_config
+            )
+            self._is_session_active = True # Mark active only after successful connection
+            print("GeminiService: Session connected.")
+
+            # Run send and receive streams concurrently.
+            # If one fails or self._stop_event is set, gather will be interrupted.
+            await asyncio.gather(
+                self._send_audio_stream(),
+                self._receive_audio_stream()
+            )
+
+        except Exception as e:
+            print(f"GeminiService: Error during session startup or execution: {e}")
+        finally:
+            print("GeminiService: start_session method is concluding (gather finished or exception).")
+            self._stop_event.set() # Ensure stop event is set for all parts
+
+            if self.session and not self.session.closed:
+                print("GeminiService: Closing session in finally block...")
+                try:
+                    await self.session.close()
+                    print("GeminiService: Session closed.")
+                except Exception as e_close:
+                    print(f"GeminiService: Error closing session in finally: {e_close}")
+            
+            self.session = None
+            self._is_session_active = False # Reset active flag
+            print("GeminiService: Session fully cleaned up.")
+
+    async def stop_session(self):
+        """
+        Signals the streaming tasks to stop. The actual cleanup happens in start_session's finally block.
+        """
+        print("GeminiService: Stop session requested.")
+        
+        if not self._stop_event.is_set():
+            self._stop_event.set()
+            print("GeminiService: Stop event set.")
+
+            # Try to unblock the mic_to_gemini_queue.get() in _send_audio_stream
+            try:
+                self.mic_to_gemini_queue.put_nowait(None) # Sentinel value
+                print("GeminiService: Placed None sentinel in mic_to_gemini_queue.")
+            except asyncio.QueueFull:
+                print("GeminiService: mic_to_gemini_queue full, couldn't place None sentinel for sender.")
+            except Exception as e: # Should not happen with asyncio.Queue
+                print(f"GeminiService: Error putting sentinel to mic_to_gemini_queue: {e}")
+        
+        # The `start_session`'s `finally` block will handle closing `self.session`
+        # when the `gather` call exits due to the `_stop_event`.
+        # Explicitly calling session.close() here might be redundant or cause issues if called too early.
+        print("GeminiService: Stop session request processed. Cleanup handled by running session task.")
+
+    def is_active(self) -> bool:
+        return self._is_session_active and not self._stop_event.is_set()
+</file>
+
+<file path="app/main.py">
+import asyncio
+import os
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from dotenv import load_dotenv
+
+from app.audio_io_handler import AudioIOHandler
+from app.gemini_service import GeminiLiveService
+
+# Load environment variables from .env file
+load_dotenv()
+
+app = FastAPI(title="Gemini Live Native Audio Streamer")
+
+# Mount static files directory
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+# Global state variables
+audio_handler: AudioIOHandler | None = None
+gemini_service: GeminiLiveService | None = None
+session_tasks: list[asyncio.Task] = []
+is_session_running: bool = False
+session_lock = asyncio.Lock()  # Lock to prevent race conditions during start/stop operations
+
+@app.on_event("startup")
+async def startup_event():
+    """
+    Event handler for application startup.
+    Checks for necessary configurations e.g. API keys.
+    """
+    print("FastAPI application starting up...")
+    api_key = os.getenv("GOOGLE_GENAI_API_KEY")
+    if not api_key:
+        print("CRITICAL: GOOGLE_GENAI_API_KEY is not set in the environment. Session start will fail.")
+    else:
+        print("GOOGLE_GENAI_API_KEY found.")
+    # Other initializations can go here if needed.
+    # PyAudio is initialized on-demand by AudioIOHandler.
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """
+    Event handler for application shutdown.
+    Ensures graceful termination of any running sessions.
+    """
+    print("FastAPI application shutting down...")
+    if is_session_running or session_tasks: # Check if there's anything to stop
+        print("Shutdown event: Session is active or tasks exist, attempting to stop...")
+        # Use the lock to ensure atomicity if a stop operation could be concurrently triggered
+        async with session_lock:
+            await stop_session_internal(initiated_by="shutdown")
+
+async def stop_session_internal(initiated_by: str = "endpoint"):
+    """
+    Internal helper function to stop the current audio streaming session.
+    Manages stopping services, cancelling tasks, and cleaning up resources.
+    """
+    global audio_handler, gemini_service, session_tasks, is_session_running
+
+    print(f"Stopping session internally (initiated by {initiated_by})...")
+    
+    # Early exit if no session is considered running and no tasks are present.
+    if not is_session_running and not session_tasks:
+        print("Stop internal: No active session or tasks to stop.")
+        is_session_running = False # Ensure flag consistency
+        return
+
+    # Set the global running flag to false immediately to prevent new operations
+    # and signal loops that rely on this flag (though dedicated stop events are preferred).
+    is_session_running = False
+
+    # 1. Signal services to stop their operations.
+    # These methods should trigger internal stop events/flags within the services.
+    if gemini_service:
+        print("Signaling Gemini service to stop...")
+        await gemini_service.stop_session() 
+    
+    if audio_handler:
+        print("Signaling Audio I/O handler to stop...")
+        await audio_handler.stop() # This also handles PyAudio termination.
+
+    # 2. Cancel and await all top-level session tasks.
+    # These tasks run the main methods of AudioIOHandler and GeminiLiveService.
+    # Cancellation helps interrupt any await calls if services don't stop cleanly from signals.
+    if session_tasks:
+        print(f"Cancelling {len(session_tasks)} session tasks...")
+        for task in session_tasks:
+            if not task.done():
+                task.cancel()
+        
+        print("Awaiting completion of cancelled tasks...")
+        results = await asyncio.gather(*session_tasks, return_exceptions=True)
+        for i, result in enumerate(results):
+            task_name = session_tasks[i].get_name() if hasattr(session_tasks[i], 'get_name') and session_tasks[i].get_name() else f"Task-{i}"
+            if isinstance(result, asyncio.CancelledError):
+                print(f"Task '{task_name}' was cancelled successfully.")
+            elif isinstance(result, Exception):
+                print(f"Task '{task_name}' raised an exception during/after cancellation: {type(result).__name__}('{result}')")
+            else:
+                print(f"Task '{task_name}' completed with result: {result}")
+        session_tasks.clear()
+        print("All session tasks processed.")
+
+    # 3. Clear global service instances.
+    audio_handler = None
+    gemini_service = None
+    
+    print("Session stopped and resources presumed cleaned up.")
+
+
+@app.post("/start-session", status_code=200)
+async def start_session_endpoint():
+    """
+    Endpoint to start a new audio streaming session with Gemini.
+    Initializes audio I/O, connects to Gemini, and starts streaming.
+    """
+    global audio_handler, gemini_service, session_tasks, is_session_running
+    
+    async with session_lock:
+        if is_session_running:
+            print("Start request failed: Session is already running.")
+            raise HTTPException(status_code=400, detail="Session is already running.")
+
+        print("Attempting to start new session...")
+        try:
+            # Verify API key presence before proceeding
+            api_key = os.getenv("GOOGLE_GENAI_API_KEY")
+            if not api_key:
+                print("ERROR: GOOGLE_GENAI_API_KEY not found. Cannot start session.")
+                raise HTTPException(status_code=500, detail="Server configuration error: GOOGLE_GENAI_API_KEY is not set.")
+
+            # Create asyncio Queues for communication between audio handler and Gemini service
+            mic_to_gemini_queue = asyncio.Queue(maxsize=100) # Maxsize for backpressure
+            gemini_to_speaker_queue = asyncio.Queue(maxsize=100)
+
+            # Initialize service components
+            audio_handler = AudioIOHandler(
+                mic_to_gemini_queue=mic_to_gemini_queue,
+                gemini_to_speaker_queue=gemini_to_speaker_queue
+            )
+            gemini_service = GeminiLiveService(
+                mic_to_gemini_queue=mic_to_gemini_queue,
+                gemini_to_speaker_queue=gemini_to_speaker_queue
+            )
+
+            # Create and store asyncio tasks for each long-running operation
+            task_record_audio = asyncio.create_task(audio_handler.record_audio(), name="record_audio_task")
+            task_play_audio = asyncio.create_task(audio_handler.play_audio(), name="play_audio_task")
+            task_gemini_session = asyncio.create_task(gemini_service.start_session(), name="gemini_session_task")
+            
+            session_tasks.extend([task_record_audio, task_play_audio, task_gemini_session])
+            is_session_running = True # Set running state
+            
+            print("Session started successfully. Tasks are running.")
+            return JSONResponse(content={"message": "Session started successfully. Speak into your microphone."})
+
+        except HTTPException: # Re-raise HTTP exceptions
+            raise
+        except Exception as e:
+            print(f"Error during session startup: {type(e).__name__} - {e}")
+            # Attempt to clean up any partially initialized resources
+            is_session_running = False # Ensure flag is reset
+            current_tasks_to_clean = list(session_tasks) # Copy before clearing
+            session_tasks.clear()
+
+            if audio_handler: await audio_handler.stop()
+            if gemini_service: await gemini_service.stop_session()
+            
+            for task in current_tasks_to_clean:
+                if not task.done(): task.cancel()
+            if current_tasks_to_clean:
+                await asyncio.gather(*current_tasks_to_clean, return_exceptions=True)
+            
+            audio_handler = None
+            gemini_service = None
+            raise HTTPException(status_code=500, detail=f"Failed to start session due to an internal error: {str(e)}")
+
+
+@app.post("/stop-session", status_code=200)
+async def stop_session_endpoint():
+    """
+    Endpoint to stop the currently active audio streaming session.
+    """
+    async with session_lock:
+        if not is_session_running and not session_tasks:
+            print("Stop request: Session not running or no tasks to stop.")
+            # Call internal stop to ensure consistency, even if already "stopped"
+            await stop_session_internal(initiated_by="endpoint_already_stopped")
+            return JSONResponse(content={"message": "Session was not running or already stopped."})
+        
+        print("Stop session endpoint called. Initiating stop procedure.")
+        await stop_session_internal(initiated_by="endpoint_active_stop")
+        return JSONResponse(content={"message": "Session stopped successfully."})
+
+@app.get("/", response_class=FileResponse)
+async def get_index_html():
+    """
+    Serves the main HTML page for the user interface.
+    """
+    # This path assumes 'static/index.html' exists relative to the project root
+    # where uvicorn is typically run.
+    static_file_path = "static/index.html"
+    if not os.path.exists(static_file_path):
+        # This fallback is less ideal; configuration should ensure correct path.
+        print(f"Warning: '{static_file_path}' not found directly. Trying '../static/index.html'. Current PWD: {os.getcwd()}")
+        static_file_path = "../static/index.html" # For cases where PWD might be 'app'
+        if not os.path.exists(static_file_path):
+             raise HTTPException(status_code=404, detail=f"Main UI file '{static_file_path}' not found.")
+    return FileResponse(static_file_path)
+
+# This block is for direct execution of this file (e.g., `python app/main.py`)
+# However, using `uvicorn app.main:app --reload` or `uv run start` is preferred.
+if __name__ == "__main__":
+    import uvicorn
+    print("Starting Uvicorn server directly for development (use 'uv run start' for configured execution)...")
+    # Ensure .env is loaded if running this way
+    if not os.getenv("GOOGLE_GENAI_API_KEY"):
+        print("WARNING: GOOGLE_GENAI_API_KEY not loaded. Direct run might fail if .env is not in search path.")
+    
+    # Uvicorn configuration should match the one in pyproject.toml for consistency.
+    uvicorn.run(
+        "app.main:app",  # Path to the FastAPI app instance
+        host="0.0.0.0",
+        port=8000,
+        reload=True      # Enable auto-reload for development
+    )
+</file>
+
+<file path="static/index.html">
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gemini Live Native Audio</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            margin: 0;
+            background-color: #f0f0f0;
+        }
+        .container {
+            background-color: #fff;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        button {
+            padding: 10px 15px;
+            margin: 5px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        #startButton {
+            background-color: #4CAF50;
+            color: white;
+        }
+        #stopButton {
+            background-color: #f44336;
+            color: white;
+        }
+        #status {
+            margin-top: 15px;
+            font-style: italic;
+            color: #555;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Gemini Live Native Audio Stream</h1>
+        <button id="startButton">Start Session</button>
+        <button id="stopButton" disabled>Stop Session</button>
+        <p id="status">Ready</p>
+    </div>
+
+    <script>
+        const startButton = document.getElementById('startButton');
+        const stopButton = document.getElementById('stopButton');
+        const statusDisplay = document.getElementById('status');
+
+        startButton.addEventListener('click', async () => {
+            statusDisplay.textContent = 'Starting session...';
+            startButton.disabled = true;
+            try {
+                const response = await fetch('/start-session', { method: 'POST' });
+                const data = await response.json();
+                if (response.ok) {
+                    statusDisplay.textContent = data.message || 'Session started. Speak into your microphone.';
+                    stopButton.disabled = false;
+                } else {
+                    statusDisplay.textContent = `Error: ${data.detail || 'Failed to start session'}`;
+                    startButton.disabled = false;
+                }
+            } catch (error) {
+                statusDisplay.textContent = `Error: ${error.message}`;
+                startButton.disabled = false;
+            }
+        });
+
+        stopButton.addEventListener('click', async () => {
+            statusDisplay.textContent = 'Stopping session...';
+            stopButton.disabled = true;
+            try {
+                const response = await fetch('/stop-session', { method: 'POST' });
+                const data = await response.json();
+                if (response.ok) {
+                    statusDisplay.textContent = data.message || 'Session stopped.';
+                    startButton.disabled = false;
+                } else {
+                    statusDisplay.textContent = `Error: ${data.detail || 'Failed to stop session'}`;
+                    stopButton.disabled = false; // Re-enable if stopping failed
+                }
+            } catch (error) {
+                statusDisplay.textContent = `Error: ${error.message}`;
+                stopButton.disabled = false; // Re-enable if stopping failed
+            }
+        });
+    </script>
+</body>
+</html>
+</file>
+
+<file path=".python-version">
+3.10
+</file>
+
+<file path="pyproject.toml">
+[project]
+name = "gemini-live-native"
+version = "0.1.0"
+description = "Streaming audio example for Gemini Live API with native audio."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "google-genai",
+    "pyaudio",
+    "fastapi",
+    "uvicorn[standard]",
+    "python-dotenv",
+    # 'taskgroup; python_version < "3.11"',
+    # 'exceptiongroup; python_version < "3.11"',
+]
+
+[tool.uv]
+scripts = { start = "uvicorn app.main:app --reload --host 0.0.0.0 --port 8000" }
+</file>
+
+</files>

@@ -1,6 +1,0 @@
-google-genai
-pyaudio
-asyncio
-fastapi
-uvicorn[standard]
-websockets

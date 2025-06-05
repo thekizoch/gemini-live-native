@@ -1,0 +1,17 @@
+[project]
+name = "gemini-live-native"
+version = "0.1.0"
+description = "Streaming audio example for Gemini Live API with native audio."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "google-genai",
+    "pyaudio",
+    "fastapi",
+    "uvicorn[standard]",
+    "python-dotenv",
+    # 'taskgroup; python_version < "3.11"',
+    # 'exceptiongroup; python_version < "3.11"',
+    "opencv-python>=4.11.0.86",
+]
+
